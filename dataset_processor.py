@@ -5,17 +5,14 @@ import random
 
 import numpy as np
 from collections import namedtuple, defaultdict
-import jieba.posseg as pseg
-from typing import List
-from functools import reduce
 import torch
 from transformers import BartTokenizer, BertTokenizer
-from transformers import BartForConditionalGeneration, BertForMaskedLM, BartForCausalLM
+from transformers import BertForMaskedLM, BartForCausalLM
 
-from utils_metrics import get_entities_bio
+from utils.utils_metrics import get_entities_bio
 import math
 import pandas as pd
-from utils import normalize_tokens, align_tokens_labels, cut_sent, pos_tagging
+from utils.utils import normalize_tokens, align_tokens_labels, cut_sent
 
 dataset_category2template = {
     "conll2003": {
