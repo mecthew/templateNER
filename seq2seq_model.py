@@ -310,6 +310,7 @@ class Seq2SeqModel:
         else:
             t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
+        print(f"Total steps: {t_total}")
         no_decay = ["bias", "LayerNorm.weight"]
 
         optimizer_grouped_parameters = []

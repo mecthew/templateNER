@@ -4,6 +4,8 @@ import pandas as pd
 import logging
 import argparse
 from seq2seq_model import Seq2SeqModel
+from dataset_processor import dataset_category2template
+from transformers import BertTokenizer, BartTokenizer
 
 logging.basicConfig(level=logging.INFO)
 transformers_logger = logging.getLogger("transformers")
@@ -36,6 +38,14 @@ eval_data = pd.read_csv(f"./data/{args.dataset}/dev.csv", sep=',').values.tolist
 eval_df = pd.DataFrame(eval_data, columns=["input_text", "target_text"])
 model_name = args.pretrain_path.replace('\\', '/').rsplit('/')[-1]
 
+category2template = dataset_category2template['weibo']
+tokenizer_class = BertTokenizer if args.dataset in ['weibo', 'resume', 'msra', 'ontonotes4'] else BartTokenizer
+tokenizer = tokenizer_class.from_pretrained(args.pretrain_path)
+o_template = category2template['O']
+template_code = sum(tokenizer([o_template], return_tensors='pt')['input_ids'][0]).item()
+transformers_logger.info(f"O template: {o_template}, code: {template_code}")
+
+
 model_args = {
     "reprocess_input_data": bool(args.reprocess_input_data),
     "overwrite_output_dir": True,
@@ -53,8 +63,8 @@ model_args = {
     "manual_seed": args.manual_seed,
     "save_steps": args.save_model_steps,
     "gradient_accumulation_steps": 1,
-    "output_dir": f"./outputs_{args.dataset}_{model_name}",
-    "best_model_dir": f"./outputs_{args.dataset}_{model_name}/best_model"
+    "output_dir": f"./outputs_{args.dataset}_{model_name}_tcode{template_code}",
+    "best_model_dir": f"./outputs_{args.dataset}_{model_name}_tcode{template_code}/best_model"
 }
 
 # Initialize model
@@ -75,3 +85,4 @@ results = model.eval_model(eval_df)
 
 print(model.predict([
                         "Japan began the defence of their Asian Cup title with a lucky 2-1 win against Syria in a Group C championship match on Friday."]))
+print(f"O template: {o_template}, code: {template_code}")

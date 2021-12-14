@@ -4,15 +4,15 @@ if [ $1 == conll2003 ]; then
   span_max_len=10
 elif [ $1 == weibo ]; then
   pretrain_path=/home/qiumengchuan/NLP/corpus/transformers/fnlp-bart-base-chinese
-  checkpoint=outputs_weibo_fnlp-bart-base-chinese/best_model
-  span_max_len=10
+  checkpoint=outputs_weibo_fnlp-bart-base-chinese_tcode7615/best_model
+  span_max_len=8
 elif [ $1 == resume ]; then
   pretrain_path=/home/qiumengchuan/NLP/corpus/transformers/fnlp-bart-base-chinese
-  checkpoint=outputs_resume_fnlp-bart-base-chinese/best_model
+  checkpoint=outputs_resume_fnlp-bart-base-chinese_tcode8988/checkpoint-10000
   span_max_len=30
 elif [ $1 == ontonotes4 ]; then
   pretrain_path=/home/qiumengchuan/NLP/corpus/transformers/fnlp-bart-base-chinese
-  checkpoint=outputs_ontonotes4_fnlp-bart-base-chinese/best_model
+  checkpoint=outputs_ontonotes4_fnlp-bart-base-chinese_tcode8988/best_model
   span_max_len=15
 elif [ $1 == msra ]; then
   pretrain_path=/home/qiumengchuan/NLP/corpus/transformers/fnlp-bart-base-chinese

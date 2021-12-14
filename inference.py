@@ -5,6 +5,7 @@ import time
 import math
 import argparse
 from dataset_processor import InputExample, dataset_category2template, punctuations, align_tokens_labels
+from dataset_processor import construct_heuristic_candidate_spans
 
 
 def template_entity(word_spans, input_txt, start):
@@ -30,7 +31,7 @@ def template_entity(word_spans, input_txt, start):
     # template_length = [tokenizer(template_list[idx],
     #                              padding="longest",
     #                              return_tensors='pt')['input_ids'].shape[1] for idx in range(num_template)]
-    same_suffix_length = 3 if not is_chinese else 4
+    same_suffix_length = 4 if is_chinese else 3
     for i in range(word_spans_number):
         for j in range(num_template):
             base_length = (tokenizer(temp_list[i * num_template + j],
@@ -55,8 +56,9 @@ def template_entity(word_spans, input_txt, start):
             # print(output_ids[:, i+1].item())
             for j in range(num_template * word_spans_number):
                 if i < output_length_list[j]:
-                    score[j] = score[j] + math.log(logits[j, int(output_ids[j][i + 1])])
-    end = start + (score.index(max(score)) // num_template)
+                    score[j] += math.log(logits[j, int(output_ids[j][i + 1])])
+    # score = [sum(s) / len(s) for s in score]
+    end = start + len(word_spans[score.index(max(score)) // num_template].split()) - 1
     # return [start_index,end_index,label,score]
     return [start, end, entity_dict[(score.index(max(score)) % num_template)], max(score)]
 
@@ -65,17 +67,25 @@ def prediction(input_txt):
     input_txt_list = input_txt.split(' ')
 
     entity_list = []
-    for i in range(len(input_txt_list)):
-        word_spans = []
-        span_max_len = args.span_max_len + int(len(input_txt_list) * args.span_alpha)
-        for j in range(1, span_max_len + 1):
-            if i+j > len(input_txt_list) or input_txt_list[i+j-1] in punctuations:
-                break
-            word_span = ' '.join(input_txt_list[i:i + j])
-            word_spans.append(word_span)
-
+    span_max_len = args.span_max_len + int(len(input_txt_list) * args.span_alpha)
+    delimiter = '' if is_chinese else ' '
+    candidate_spans = construct_heuristic_candidate_spans(input_txt_list, max_span_len=span_max_len,
+                                                          delimiter=delimiter, min_cover_len=3,
+                                                          is_chinese=is_chinese)
+    candidate_spans = [[' '.join(input_txt_list[pos[0]: pos[1] + 1]) for pos in candidate_spans if pos[0] == i]
+                       for i in range(len(input_txt_list))]
+    # for i in range(len(input_txt_list)):
+    #     word_spans = []
+    #     span_max_len = args.span_max_len + int(len(input_txt_list) * args.span_alpha)
+    #     for j in range(1, span_max_len + 1):
+    #         if i+j > len(input_txt_list) or input_txt_list[i+j-1] in punctuations:
+    #             break
+    #         word_span = ' '.join(input_txt_list[i:i + j])
+    #         word_spans.append(word_span)
+    for ith, word_spans in enumerate(candidate_spans):
         if len(word_spans) > 0:
-            entity = template_entity(word_spans, input_txt, i)  # [start_index,end_index,label,score]
+            word_spans.sort(key=lambda x: len(x.split()))
+            entity = template_entity(word_spans, input_txt, ith)  # [start_index,end_index,label,score]
             if entity[1] >= len(input_txt_list):
                 entity[1] = len(input_txt_list) - 1
             if entity[2] != 'O':
@@ -182,6 +192,7 @@ results = {
     "recall": recall_score(true_entities, pred_entities)
 }
 print(results)
+print(classification_report(true_entities, pred_entities))
 
 # save preds_list and trues_list
 # for num_point in range(len(preds_list)):
