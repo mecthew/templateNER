@@ -4,8 +4,21 @@ from collections import defaultdict
 
 import jieba
 from typing import List
-from langconv import tradition2simple
+
+import torch
+import warnings
+
+from utils.langconv import tradition2simple
 import jieba.posseg as pseg
+
+
+class StructDict(dict):
+
+    def __getattr__(self, key):
+        return self.get(key)
+
+    def __setattr__(self, key, value):
+        self[key] = value
 
 
 def append_index_for_cuts(sent, cuts):
@@ -66,24 +79,30 @@ def is_english_word(word):
 def normalize_tokens(text: str or List):
     # normalize token
     characters_translation_table = str.maketrans(
-        "️—…“”‘’áéíóúýàèìòùỳâêîôûŷäëïöüÿñÁÉÍÓÚÝÀÈÌÒÙỲÂÊÎÔÛŶÄËÏÖÜŸａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
-        " -。\"\"\'\'aeiouyaeiouyaeiouyaeiouynAEIOUYAEIOUYAEIOUYAEIOUYabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "áéíóúýàèìòùỳâêîôûŷäëïöüÿñÁÉÍÓÚÝÀÈÌÒÙỲÂÊÎÔÛŶÄËÏÖÜŸａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
+        "aeiouyaeiouyaeiouyaeiouynAEIOUYAEIOUYAEIOUYAEIOUYabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     )
-    digits_translation = {'⒈': '1.', '⒉': '2.', '⒊': '3.', '⒋': '4.', '⒌': '5.',
-                          '⒍': '6.', '⒎': '7.', '⒏': '8.', '⒐': '9.', '⒑': '10.',
-                          'Ⅰ': '1', 'Ⅱ': '2', 'Ⅲ': '3', 'Ⅳ': '4', 'Ⅴ': '5',
-                          'Ⅵ': '6', 'Ⅶ': '7', 'Ⅷ': '8', 'Ⅸ': '9', 'Ⅹ': '10'}
+    # digits_translation = {'⒈': '1.', '⒉': '2.', '⒊': '3.', '⒋': '4.', '⒌': '5.',
+    #                       '⒍': '6.', '⒎': '7.', '⒏': '8.', '⒐': '9.', '⒑': '10.',
+    #                       'Ⅰ': '1', 'Ⅱ': '2', 'Ⅲ': '3', 'Ⅳ': '4', 'Ⅴ': '5',
+    #                       'Ⅵ': '6', 'Ⅶ': '7', 'Ⅷ': '8', 'Ⅸ': '9', 'Ⅹ': '10',
+    #                       '０': '0', '１': '1', '２': '2', '３': '3', '４': '4', '５': '5',
+    #                       '６': '6', '７': '7', '８': '8', '９': '9'}
+    digits_chinese_translation_table = str.maketrans(
+        "️．—…“”‘’＊％⒈⒉⒊⒋⒌⒍⒎⒏⒐ⅠⅡⅢⅣⅤⅥⅦⅧⅨ０１２３４５６７８９",
+        " .-。\"\"\'\'%火1234567891234567890123456789"
+    )
 
     if isinstance(text, str):
-        for key, value in digits_translation.items():
-            text = text.replace(key, value)
+        text = text.translate(digits_chinese_translation_table)
         return text.translate(characters_translation_table)
     elif isinstance(text, List):
-        new_text = []
-        for tok in text:
-            for key, value in digits_translation.items():
-                tok = tok.replace(key, value)
-            new_text.append(tok)
+        # new_text = []
+        # for tok in text:
+        #     for key, value in digits_translation.items():
+        #         tok = tok.replace(key, value)
+        #     new_text.append(tok)
+        new_text = [tok.translate(digits_chinese_translation_table) for tok in text]
         return [tok.translate(characters_translation_table) for tok in new_text]
     else:
         raise ValueError(f"type {type(text)} is not supported !")
@@ -93,8 +112,15 @@ def align_tokens_labels(tokens: List, labels: List):
     """
         Reorganize English characters to form a word and align labels
     """
+    origin_len = sum(map(len, tokens))
+    origin_tokens = tokens.copy()
     tokens = normalize_tokens(tokens)
     tokens = tradition2simple(tokens)
+    normalize_len = sum(map(len, tokens))
+    if origin_len != normalize_len:
+        warnings.warn(f"tokens length inconsistent after normalizing, origin: {origin_tokens}, {normalize_len},"
+                      f" normalize: {tokens}, {origin_len}, ")
+
     new_tokens, new_labels = [], []
     prev_word = ""
     prev_tag_list = []
@@ -124,6 +150,45 @@ def align_tokens_labels(tokens: List, labels: List):
 
 def pos_tagging(sentence):
     return [(w.word, w.flag) for w in pseg.cut(sentence)]
+
+
+def chinese_to_english_punct(sent, dims=1, replace_lst=["，", "。", "！", "？", "；", "（", "）", "＠", "＃", "【", "】", "+", "=", "-", "：", "“",  "”",  "‘",  "’",  "》",  "《",  "「",  "」",], target_lst =  [",", ".", "!", "?", ";", "(", ")", "@", "#", "[", "]", "+", "=", "-", ":", '"', '"', "'", "'", ">", "<", "{", "}", ]):
+    """
+
+    :param sent: List[str] or str
+    :param dims: dims=1 means sent is `str`, dims=2 means sent is List[str]
+    :param replace_lst: chinese punctuations
+    :param target_lst: normalized punctuations
+    :return:
+    """
+    # chinese punctuation to english punctuation
+    if dims == 1:
+        for item_idx, (replace_item, target_item) in enumerate(zip(replace_lst, target_lst)):
+            if replace_item not in sent:
+                continue
+            sent = sent.replace(replace_item, target_item)
+        return sent
+    elif dims == 2:
+        tar_lst = []
+        for sent_item in sent:
+            tmp_sent = chinese_to_english_punct(sent_item, dims=1)
+            tar_lst.append(tmp_sent)
+        return tar_lst
+
+
+def make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
+    """
+    Make causal mask used for bi-directional self-attention. 1 means `no mask`, 0 means `mask`
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = torch.full((tgt_len, tgt_len), 0)
+    mask_cond = torch.arange(mask.size(-1))
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 1)
+    mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.ones(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+    return mask[None, :, :].expand(bsz, tgt_len, tgt_len + past_key_values_length)
 
 
 if __name__ == '__main__':
