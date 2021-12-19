@@ -2,17 +2,21 @@
 import json
 import os
 import random
+import sys
 
 import numpy as np
 from collections import namedtuple, defaultdict
 import torch
-from transformers import BartTokenizer, BertTokenizer
-from transformers import BertForMaskedLM, BartForCausalLM
+from transformers import BertTokenizer, BertForMaskedLM, BertLMHeadModel
+from transformers import BartTokenizer, BartForCausalLM, BartForConditionalGeneration
 
 from utils.utils_metrics import get_entities_bio
 import math
 import pandas as pd
-from utils.utils import normalize_tokens, align_tokens_labels, cut_sent
+from utils.tools import (normalize_tokens, align_tokens_labels, cut_sent, chinese_to_english_punct, pos_tagging,
+                         make_causal_mask, is_english_word)
+from utils.seed import fix_seed
+# import ddparser
 
 dataset_category2template = {
     "conll2003": {
@@ -37,9 +41,9 @@ dataset_category2template = {
     },
     "resume": {
         "CONT": "是 国 家 实 体 。",
-        "EDU": "是 教 育 实 体 。",
+        "EDU": "是 学 历 实 体 。",
         "LOC": "是 地 区 实 体 。",
-        "NAME": "是 人 名 实 体 。",
+        "NAME": "是 人 物 实 体 。",
         "ORG": "是 机 构 实 体 。",
         "PRO": "是 专 业 实 体 。",
         "RACE": "是 民 族 实 体 。",
@@ -47,19 +51,19 @@ dataset_category2template = {
         "O": "不 是 实 体 。",
     },
     "weibo": {
-        "GPE.NAM": "是 国 家 实 体 。",
-        "GPE.NOM": "指 代 城 市 实 体 。",
-        "LOC.NAM": "是 景 物 实 体 。",
-        "LOC.NOM": "指 代 景 物 实 体 。",
+        "GPE.NAM": "是 地 区 实 体 。",
+        "GPE.NOM": "指 代 地 区 实 体 。",
+        "LOC.NAM": "是 景 点 实 体 。",
+        "LOC.NOM": "指 代 景 点 实 体 。",
         "ORG.NAM": "是 机 构 实 体 。",
         "ORG.NOM": "指 代 机 构 实 体 。",
-        "PER.NAM": "是 人 名 实 体 。",
-        "PER.NOM": "指 代 人 名 实 体 。",
+        "PER.NAM": "是 人 物 实 体 。",
+        "PER.NOM": "指 代 人 物 实 体 。",
         "O": "不 是 实 体 。",
     },
 }
 
-punctuations = [",", ".", ";", ":", "!", "?", "\"", "，", "。", "；", "：", "？", "！", "@", "\\", "/", "#",
+punctuations = [",", ";", ":", "!", "?", "，", "。", "；", "：", "？", "！", "@", "\\", "/", "#",
                 "%", "&", "|", "*", "%", "~", "+", "$", "[", "]", "{", "}", "^", "☀", "�"]
 
 
@@ -71,21 +75,25 @@ class InputExample(object):
 
 class DatasetProcessor(object):
 
-    def __init__(self, dataset_dir, category2template, span_max_len=10, span_alpha=0.05, tokenizer=None,
-                 analyze_sent_cuts=False):
+    def __init__(self, dataset_dir, category2template, span_max_len=10, span_alpha=0.05, model=None, tokenizer=None,
+                 analyze_sent_cuts=False, analyze_oov_tokens=False):
         self.dataset_dir = dataset_dir
         self.dataset = dataset_dir.replace('\\', '/').rsplit('/', maxsplit=1)[-1]
         self.is_chinese = True if self.dataset in ['msra', 'ontonotes4', 'resume', 'weibo'] else None
         self.category2template = category2template
         self.span_max_len = span_max_len
         self.span_alpha = span_alpha
+        self.model = model
         self.tokenizer = tokenizer
-        # self.lac = paddlehub.Module(name='lac')
+        self.analyze_sent_cuts = analyze_sent_cuts
+        self.analyze_oov_tokens = analyze_oov_tokens
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.entity_hits = defaultdict(int)
         self.output_dir = './dataset_info'
         self.is_chinese = bool(self.dataset in ['msra', 'ontonotes4', 'resume', 'weibo'])
         self.delimiter = "" if self.is_chinese else " "
-        self.analyze_sent_cuts = analyze_sent_cuts
+
 
         self.train_path = os.path.join(dataset_dir, 'train.txt')
         self.dev_path = os.path.join(dataset_dir, 'valid.txt')
@@ -95,7 +103,7 @@ class DatasetProcessor(object):
 
         self.train_data, self.dev_data, self.test_data = self._read_data()
         # index 0 means length 1
-        self.dataset_entity_info = self.get_dataset_entity_info()
+        self.dataset_entity_info = None
 
     def get_dataset_entity_info(self):
         settype2data = {'train': self.train_data, 'dev': self.dev_data, 'test': self.test_data}
@@ -106,6 +114,7 @@ class DatasetProcessor(object):
 
         unk_tokens = set()
         entities_set = defaultdict(set)
+        single_entities_set = defaultdict(set)
         for set_type, data in settype2data.items():
             entity_length_cnt = defaultdict(int)
             entity_tag_cnt = defaultdict(int)
@@ -113,7 +122,7 @@ class DatasetProcessor(object):
             incorrect_split_sent = []
             incorrect_split_cnt = defaultdict(int)
             for example in data:
-                if self.tokenizer is not None:
+                if self.analyze_oov_tokens and self.tokenizer is not None:
                     try:
                         token_ids = self.tokenizer(example.words,
                                                    return_tensors='np',
@@ -128,9 +137,12 @@ class DatasetProcessor(object):
                 entities = get_entities_bio(labels)
                 for entity in entities:
                     entity_type, posb, pose = entity
+                    if any(p in words[posb: pose + 1] for p in ['{', '[', '|', 'unknown']):
+                        print(set_type, self.delimiter.join(words[posb: pose + 1]), "contains special tokens", example.words)
                     entity_length_cnt[pose - posb + 1] += 1
                     entities_set[set_type].add(self.delimiter.join(words[posb: pose + 1]))
-
+                    if pose == posb:
+                        single_entities_set[set_type].add(self.delimiter.join(words[posb: pose + 1]))
                 if self.analyze_sent_cuts:
                     cuts_with_char_pos = cut_sent(''.join(words), cut_all=True)
                     entities_with_char_pos = [(ent[0], sum(map(len, words[:ent[1]])),
@@ -189,10 +201,16 @@ class DatasetProcessor(object):
                 print(f"{set_type}: \nincorrect split: {incorrect_split_sent}\nentity_tag_cnt: {entity_tag_cnt}")
 
         print(
-            f"Train_Dev intersection rate: "
+            f"Train_Dev entity intersection rate: "
             f"{len(entities_set['train'].intersection(entities_set['dev'])) / (len(entities_set['dev']) + 1e-9)}, "
-            f"Train_Test intersection rate: "
+            f"Train_Test entity intersection rate: "
             f"{len(entities_set['train'].intersection(entities_set['test'])) / (len(entities_set['test']) + 1e-9)}"
+        )
+        print(
+            f"Train_dev single word entity intersection rate: "
+            f"{len(single_entities_set['train'].intersection(single_entities_set['dev'])) / (len(single_entities_set['dev']) + 1e-9)}, "
+            f"Train_Test entity intersection rate: "
+            f"{len(single_entities_set['train'].intersection(single_entities_set['test'])) / (len(single_entities_set['test']) + 1e-9)}"
         )
         os.makedirs(self.output_dir, exist_ok=True)
         with open(os.path.join(self.output_dir, f'{self.dataset}_entities.txt'), 'w', encoding='utf8') as fout:
@@ -209,14 +227,32 @@ class DatasetProcessor(object):
         train_lens = sorted(list(map(len, [example.words for example in self.train_data])))
         dev_lens = sorted(list(map(len, [example.words for example in self.dev_data])))
         test_lens = sorted(list(map(len, [example.words for example in self.test_data])))
+
+        self.dataset_entity_info = self.get_dataset_entity_info()
         train_entity_lengths = self.dataset_entity_info['train']['entity_length_array']
         total_train_entity_num = self.dataset_entity_info['train']['total_entities_num']
         train_entity_995percent_idx = 0
         train_entity_995percent_num = 0
+        dev_entity_lengths = self.dataset_entity_info['dev']['entity_length_array']
+        total_dev_entity_num = self.dataset_entity_info['dev']['total_entities_num']
+        dev_entity_995percent_idx = 0
+        dev_entity_995percent_num = 0
+        test_entity_lengths = self.dataset_entity_info['test']['entity_length_array']
+        total_test_entity_num = self.dataset_entity_info['test']['total_entities_num']
+        test_entity_995percent_idx = 0
+        test_entity_995percent_num = 0
         while train_entity_995percent_num < int(0.995 * total_train_entity_num) \
                 and train_entity_995percent_idx < len(train_entity_lengths):
             train_entity_995percent_num += train_entity_lengths[train_entity_995percent_idx]
             train_entity_995percent_idx += 1
+        while dev_entity_995percent_num < int(0.995 * total_dev_entity_num) \
+                and dev_entity_995percent_idx < len(dev_entity_lengths):
+            dev_entity_995percent_num += dev_entity_lengths[dev_entity_995percent_idx]
+            dev_entity_995percent_idx += 1
+        while test_entity_995percent_num < int(0.995 * total_test_entity_num) \
+                and test_entity_995percent_idx < len(test_entity_lengths):
+            test_entity_995percent_num += test_entity_lengths[test_entity_995percent_idx]
+            test_entity_995percent_idx += 1
         dataset_info = {
             "train_examples": len(self.train_data),
             "dev_examples": len(self.dev_data),
@@ -226,11 +262,16 @@ class DatasetProcessor(object):
             "train_entity_99.5%_len": train_entity_995percent_idx + 1,
             "train_sent_avg_len": round(np.mean(train_lens), 2),
             "train_sent_99.9%_len": train_lens[int(len(train_lens) * 0.999)],
+            "dev_entity_max_len": len(dev_entity_lengths),
+            "dev_entity_99.5%_len": dev_entity_995percent_idx + 1,
             "dev_sent_avg_len": round(np.mean(dev_lens), 2) if len(dev_lens) else "null",
             "dev_sent_99.9%_len": dev_lens[int(len(dev_lens) * 0.999)] if len(dev_lens) else "null",
+            "test_entity_max_len": len(test_entity_lengths),
+            "test_entity_99.5%_len": test_entity_995percent_idx + 1,
             "test_sent_avg_len": round(np.mean(test_lens), 2) if len(dev_lens) else "null",
             "test_sent_99.9%_len": test_lens[int(len(test_lens) * 0.999)] if len(dev_lens) else "null",
         }
+
         print(dataset_info)
         return dataset_info
 
@@ -342,8 +383,40 @@ class DatasetProcessor(object):
                         words, entities, score = items
                         fout.write(' '.join(words) + '\t' + str(entities) + '\t' + str(score) + '\n')
 
-    def construct_templates_from_example(self, example, times_of_negative_example, set_type,
-                                         negative_min_num=5, sentence_negative_alpha=0.1):
+    def analyze_candidate_span_by_bart(self, model, tokenizer):
+        os.makedirs(self.output_dir, exist_ok=True)
+        settype2data = {'train': self.train_data, 'dev': self.dev_data, 'test': self.test_data} if dataset != 'msra' \
+            else {'train': self.train_data, 'test': self.test_data}
+        train_entity_min_score = None
+        for set_type, data in settype2data.items():
+            avg_min_entity_score = []
+            total_span_with_smaller_val = 0
+            total_span = 0
+            if not data:
+                continue
+            else:
+                for ith, example in enumerate(data):
+                    # compare_score = train_entity_min_score
+                    min_entity_score, entities, num_span_smaller_than_min_entity, num_non_entity_span = \
+                        analyze_candidate_span_score(example, self.span_max_len, tokenizer, model,
+                                                     train_entity_min_score=None)
+                    if entities:
+                        if min_entity_score != -sys.maxsize:
+                            avg_min_entity_score.append(min_entity_score)
+                        total_span_with_smaller_val += num_span_smaller_than_min_entity
+                        total_span += num_non_entity_span
+                    # print(min_entity_score, entities, num_span_smaller_than_min_entity, num_non_entity_span)
+                    # exit(0)
+                    if ith >= 200:
+                        break
+            if set_type == 'train':
+                train_entity_min_score = sorted(avg_min_entity_score, reverse=True)[
+                    int(len(avg_min_entity_score) * 0.999)]
+            print(f"{self.dataset} {set_type}, avg_min_entity_score: {np.mean(avg_min_entity_score)},"
+                  f" candidate_span_wit_smaller_val rate: {total_span_with_smaller_val / total_span}")
+
+    def construct_templates_from_example(self, example, filter_method, times_of_negative_example, set_type,
+                                         negative_min_num=3, sentence_negative_alpha=0.1):
         CsvInputExample = namedtuple("CsvInputExample", ['input_text', "target_text"])
         span_max_len = min(self.span_max_len + int(self.span_alpha * len(example.words)),
                            self.dataset_entity_info['train']['entity_longest_len'])
@@ -353,6 +426,9 @@ class DatasetProcessor(object):
         entity_positions = [(posb, pose) for ent_type, posb, pose in entities]
         for entity in entities:
             ent_type, posb, pose = entity
+            # remove positive samples that larger than span_max_len
+            if pose + 1 - posb > span_max_len:
+                continue
             positive_target_texts.append(' '.join(example.words[posb: pose + 1])
                                          + " " + self.category2template[ent_type.upper()])
 
@@ -361,12 +437,27 @@ class DatasetProcessor(object):
         assert len(choose_probs) == span_max_len
         negative_example_probs = []
         negative_example_span_lengths = [0] * span_max_len
-        candidate_spans = construct_heuristic_candidate_spans(example.words, span_max_len, delimiter=self.delimiter,
-                                                              min_cover_len=3)
-        candidate_spans_based_on_positive = construct_candidate_spans_based_on_positive_spans(example,
-                                                                                              span_max_len,
-                                                                                              negative_num=5)
-
+        if filter_method == 'jieba':
+            candidate_spans = construct_candidate_spans_by_jieba(example.words, span_max_len,
+                                                                  delimiter=self.delimiter,
+                                                                  min_cover_len=3)
+        elif filter_method == 'lm':
+            candidate_spans = construct_candidate_spans_filter_by_score(example.words, span_max_len,
+                                                                        self.delimiter,
+                                                                        min_cover_len=3,
+                                                                        model=self.model,
+                                                                        tokenizer=self.tokenizer,
+                                                                        device=self.device
+                                                                        )
+        else:
+            raise Exception(f"Not implemented filter method: {filter_method} !")
+        # candidate_spans_based_on_positive = construct_candidate_spans_based_on_positive_spans(example,
+        #                                                                                       span_max_len,
+        #                                                                                       negative_num=5)
+        candidate_spans_based_on_positive = []
+        total_candidate_spans_without_filter = sum(len(example.words) - i if len(example.words) > i else 0
+                                                   for i in range(span_max_len))
+        total_candidate_spans_after_filter = len(candidate_spans)
         for span in candidate_spans:
             posb, pose = span
             span_len = pose - posb + 1
@@ -378,62 +469,228 @@ class DatasetProcessor(object):
                 negative_example_probs.append((choose_probs[span_len - 1], span_len - 1))
                 negative_example_span_lengths[span_len - 1] += 1
 
-        if len(negative_target_texts) > 0:
+        if len(negative_target_texts) > 0 and set_type not in ['dev', 'test']:
             # normalized probability
             negative_example_probs = [item[0] / negative_example_span_lengths[item[1]] for item in
                                       negative_example_probs]
             # to avoid error caused by np.random.choice
             negative_example_probs[-1] = 1 - sum(negative_example_probs[:-1])
-            negative_min_num = max(int(len(example.words) * sentence_negative_alpha), negative_min_num)
+            sample_num = min(max(int(len(positive_target_texts) * times_of_negative_example), negative_min_num),
+                             len(negative_target_texts))
             select_negative_texts = list(
                 np.random.choice(negative_target_texts,
                                  replace=False,
-                                 size=min(negative_min_num, len(negative_target_texts)),
+                                 size=sample_num,
                                  p=negative_example_probs
                                  ))
 
             # append bias negative sample
-            for negative_span in candidate_spans_based_on_positive:
-                posb, pose = negative_span
-                negative_text = " ".join(example.words[posb: pose+1]) + " " + self.category2template["O"]
-                select_negative_texts.append(negative_text)
-            select_negative_texts = list(set(select_negative_texts))
+            # for negative_span in candidate_spans_based_on_positive:
+            #     posb, pose = negative_span
+            #     negative_text = " ".join(example.words[posb: pose + 1]) + " " + self.category2template["O"]
+            #     select_negative_texts.append(negative_text)
+            # select_negative_texts = list(set(select_negative_texts))
         else:
             select_negative_texts = []
-            print("null negative examples", example.words)
+            # print("null negative examples", example.words)
 
+        # remove positive samples that larger than span_max_len
         template_examples = []
         for target_text in positive_target_texts + select_negative_texts:
             template_example = CsvInputExample(input_text=' '.join(example.words),
                                                target_text=target_text)
             template_examples.append(template_example)
-        return template_examples, positive_target_texts, negative_target_texts
+        return template_examples, positive_target_texts, negative_target_texts, \
+               total_candidate_spans_without_filter, total_candidate_spans_after_filter
 
-    def to_csv(self, times_of_negative_example=1.5):
+    def to_csv(self, filter_method="lm", times_of_negative_example=1.5):
         train_dev_test_data = {'train': self.train_data, "dev": self.dev_data,
                                "test": self.test_data}
 
         for set_type, examples in train_dev_test_data.items():
-            output_path = os.path.join(self.dataset_dir, f"{set_type}.csv")
+            # if set_type in ['train', 'dev']:
+            #     continue
+            total_candidate_spans = 0
+            total_filter_spans = 0
+            output_path = os.path.join(self.dataset_dir, f"{set_type}_{times_of_negative_example}times.csv")
             set_type_template_examples = []
             for example in examples:
-                new_times_of_negative_example = times_of_negative_example if set_type == 'train' else 1.0
-                template_examples, _, _ = self.construct_templates_from_example(example,
-                                                                                new_times_of_negative_example,
-                                                                                set_type)
+                # times_of_negative_example = times_of_negative_example if set_type == 'train' else 1.0
+                template_examples, _, _, total_candidate_spans_without_filter, total_candidate_spans_after_filter \
+                    = self.construct_templates_from_example(example,
+                                                            filter_method,
+                                                            times_of_negative_example,
+                                                            set_type)
                 set_type_template_examples.extend(template_examples)
+                total_candidate_spans += total_candidate_spans_without_filter
+                total_filter_spans += total_candidate_spans_after_filter
             dataframe = pd.DataFrame({'input_text': [ex.input_text for ex in set_type_template_examples],
                                       "target_text": [ex.target_text for ex in set_type_template_examples]})
-            # if set_type in ['train', 'dev']:
-            #     dataframe.to_csv(output_path, index=False, sep=',', header=True, encoding='utf8')
-            print(f"{set_type}: "
-                  f"{self.entity_hits[set_type] / self.dataset_entity_info[set_type]['total_entities_num']}")
+            if set_type in ['train', 'dev']:
+                dataframe.to_csv(output_path, index=False, sep=',', header=True, encoding='utf8')
+            print(f"{self.dataset}-{set_type}: "
+                  f"entity hit: {self.entity_hits[set_type] / self.dataset_entity_info[set_type]['total_entities_num']},"
+                  f" candidate spans filter rate: {1 - total_filter_spans / total_candidate_spans}")
             print(f"{set_type.capitalize()} data save to csv: {output_path}")
 
 
-def construct_heuristic_candidate_spans(words, max_span_len, delimiter='', min_cover_len=3, is_chinese=True):
+def analyze_candidate_span_score(example, max_span_len, tokenizer, model: BartForConditionalGeneration,
+                                 train_entity_min_score=None):
+    entities = get_entities_bio(example.labels)
+    entities_pos = [(ent[1], ent[2]) for ent in entities]
+    # words = chinese_to_english_punct(example.words, dims=2)
+    words = example.words
+    suffix = " 是 实 体 。"
+    target_texts = []
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    entity_flag = []
+    for i in range(len(words)):
+        for j in range(1, max_span_len + 1):
+            if i + j <= len(words) and words[i + j - 1] in punctuations:
+                break
+            else:
+                target_texts.append(' '.join(words[i: i + j]) + suffix)
+                entity_flag.append(int((i, i + j - 1) in entities_pos))
+
+    num_examples = len(target_texts)
+    if num_examples == 0:
+        return -1, entities, 0, 0
+
+    model.to(device)
+    model.eval()
+    score = [0] * num_examples
+    batch_size = min(num_examples, 300)
+    example_length = []
+    with torch.no_grad():
+        for k in range(math.ceil(num_examples / batch_size)):
+            input_texts = [' '.join(words)] * (min(num_examples, batch_size * (k + 1)) - batch_size * k)
+            input_ids = tokenizer(input_texts, padding='longest', return_tensors='pt')['input_ids']
+            decoder_inputs = tokenizer(target_texts[batch_size * k: batch_size * (k + 1)],
+                                       padding='longest',
+                                       return_tensors='pt')
+            decoder_input_ids = decoder_inputs['input_ids']
+            decoder_input_lengths = torch.sum(decoder_inputs['attention_mask'], dim=-1)
+            example_length += (decoder_input_lengths - 2).tolist()
+            output = model(input_ids=input_ids.to(device),
+                           decoder_input_ids=decoder_input_ids[:, :-1].to(device)
+                           )[0]
+            for i in range(decoder_input_ids.shape[1] - 1):
+                # print(input_ids.shape)
+                logits = output[:, i, :]
+                logits = logits.softmax(dim=1)
+                # values, predictions = logits.topk(1,dim = 1)
+                logits = logits.to('cpu').numpy()
+                # print(output_ids[:, i+1].item())
+                for j in range(input_ids.shape[0]):
+                    if i < decoder_input_lengths[j] - 2:
+                        score[batch_size * k + j] += math.log(logits[j, decoder_input_ids[j][i + 1].item()])
+
+    # for i in range(num_examples):
+    #     score[i] /= example_length[i]
+    if sum(entity_flag) == 0:
+        min_entity_val = -sys.maxsize
+    else:
+        min_entity_val = min([score[i] for i in range(num_examples) if entity_flag[i]])
+
+    compare_score = train_entity_min_score if train_entity_min_score is not None else min_entity_val
+    num_span_smaller_than_min_entity = sum(1 if not entity_flag[i] and score[i] < compare_score else 0
+                                           for i in range(num_examples))
+    num_non_entity_span = sum(1 if not entity_flag[i] else 0 for i in range(num_examples))
+    # print(compare_score, num_span_smaller_than_min_entity, num_non_entity_span)
+    return min_entity_val, entities, num_span_smaller_than_min_entity, num_non_entity_span
+
+
+def construct_candidate_spans_filter_by_score(words, max_span_len, delimiter, min_cover_len,
+                                              model, tokenizer, device):
     """
-    :param example: a namedtuple object, contains keys `words` and `labels`
+    :param words: a namedtuple object, contains keys `words` and `labels`
+    :param max_span_len: the max length of candidate spans
+    :param delimiter: str
+    :param min_cover_len: spans that lengths not larger than `min_cover_len` would be preserved
+    :return: List, [(span_begin1, span_end1), ...]
+    """
+    prompt_suffix = " 是 实 体 ."
+    prompt_suffix_length = len(prompt_suffix.split())
+    candidate_spans, target_texts = [[] for _ in range(2)]
+    span_lengths = []
+    for i in range(len(words)):
+        for j in range(1, max_span_len + 1):
+            if i + j <= len(words) and words[i + j - 1] in punctuations:
+                break
+            else:
+                candidate_spans.append((i, i + j - 1))
+                target_texts.append(' '.join(words[i: i + j]) + prompt_suffix)
+                span_lengths.append(j)
+
+    num_examples = len(target_texts)
+    if num_examples > 0:
+        sentence = delimiter.join(words)
+        model.to(device)
+        score = [0] * num_examples
+        example_length = []
+        batch_size = min(num_examples, 200)
+        encoder_inputs = tokenizer([sentence], return_tensors='pt')
+        encoder_inputs = {k: v.to(device) for k, v in encoder_inputs.items() if isinstance(model, BertForMaskedLM)
+                          or k != 'token_type_ids'}
+        encoder_attention_mask = encoder_inputs['attention_mask']
+        if isinstance(model, BertLMHeadModel):
+            model.config.is_decoder = False
+            encoder_outputs = model(**encoder_inputs)[0]
+        else:
+            encoder_outputs = model.get_encoder()(**encoder_inputs, return_dict=True)['last_hidden_state']
+
+        with torch.no_grad():
+            model.eval()
+            for iter in range(math.ceil(num_examples / batch_size)):
+                decoder_inputs = tokenizer(target_texts[batch_size * iter: batch_size * (iter + 1)],
+                                           padding='longest',
+                                           return_tensors='pt')
+                decoder_input_ids = decoder_inputs['input_ids'].to(device)
+                decoder_input_lengths = torch.sum(decoder_inputs['attention_mask'], dim=-1)
+                example_length += (decoder_input_lengths - 2).tolist()  # -2 for bos and eos
+
+                if isinstance(model, BertLMHeadModel):
+                    model.config.is_decoder = True
+                    decoder_input_ids = decoder_input_ids[:, :-1]
+                    decoder_token_type_ids = decoder_inputs['token_type_ids'][:, :-1].to(device)
+                    decoder_attention_mask = make_causal_mask(decoder_input_ids.shape,
+                                                              dtype=decoder_input_ids.dtype).to(device)
+                    output = model(encoder_hidden_states=encoder_outputs.expand(decoder_input_ids.shape[0], -1, -1),
+                                   encoder_attention_mask=encoder_attention_mask.expand(decoder_input_ids.shape[0], -1),
+                                   input_ids=decoder_input_ids,
+                                   token_type_ids=decoder_token_type_ids,
+                                   attention_mask=decoder_attention_mask
+                                   )[0]
+                else:
+                    # bart decoder use encoder_outputs[0] as inputs
+                    output = model(encoder_outputs=[encoder_outputs.expand(decoder_input_ids.shape[0], -1, -1)],
+                                   attention_mask=encoder_attention_mask.expand(decoder_input_ids.shape[0], -1),
+                                   decoder_input_ids=decoder_input_ids[:, :-1]
+                                   )[0]
+                for i in range(decoder_input_ids.shape[1] - 1):
+                    # print(input_ids.shape)
+                    logits = output[:, i, :]
+                    logits = logits.softmax(dim=1)
+                    # values, predictions = logits.topk(1,dim = 1)
+                    logits = logits.to('cpu').numpy()
+                    # print(output_ids[:, i+1].item())
+                    for j in range(decoder_input_ids.shape[0]):
+                        if i < decoder_input_lengths[j] - 2 - prompt_suffix_length + 1:
+                            score[batch_size * iter + j] += math.log(logits[j, decoder_input_ids[j][i + 1].item()])
+
+        # for j in range(num_examples):
+        #     score[j] /= (span_lengths[j] + 1)
+        assert len(candidate_spans) == len(score)
+        candidate_spans_with_score = sorted(list(zip(candidate_spans, score)), key=lambda x: x[1], reverse=True)
+        reserve_rate = max(1.0 - 0.06 * len(words) / 50, 0.2)
+        candidate_spans = [x[0] for x in candidate_spans_with_score[:int(num_examples * reserve_rate)]]
+    return candidate_spans
+
+
+def construct_candidate_spans_by_jieba(words, max_span_len, delimiter='', min_cover_len=3, is_chinese=True):
+    """
+        Use jieba to select possible candidate spans
+    :param words: a namedtuple object, contains keys `words` and `labels`
     :param max_span_len: the max length of candidate spans
     :param delimiter: str
     :param min_cover_len: spans that lengths not larger than `min_cover_len` would be preserved
@@ -449,18 +706,50 @@ def construct_heuristic_candidate_spans(words, max_span_len, delimiter='', min_c
     candidate_spans = []
     for i in range(len(words)):
         for j in range(1, max_span_len + 1):
-            if i + j > len(words) or words[i + j - 1] in punctuations:
+            if i + j > len(words) or words[i + j - 1] in punctuations or \
+                    words[i].startswith("的"):
                 break
             # the part of speech tagging of the first word can not in the list
-            # elif is_chinese and pos_tagging(delimiter.join(words[i: i + j]))[0][-1] \
-            #         in ['p', 'yg', 'ag', 'x', 'y', 'h', 'f', 'c']:
-            #     break
+            elif is_chinese and j == 1 and is_english_word(words[i]) and pos_tagging(words[i] + "不是实体。")[0][-1] \
+                    in ['rg', 'k', 'uz', 'ul', 'vg', 'ud', 'u', 'tg', 'z', 'ad', 'uj', 'r', 'e', 'ug', 'l', 'an', 'y', 't', 'o', 'mg', 'i', 's', 'nrfg', 'ag', 'dg']:
+
+                continue
             elif j <= min_cover_len:
                 candidate_spans.append((i, i + j - 1))
             elif wordidx2sentidx[i][0] in cuts_start_pos and wordidx2sentidx[i + j - 1][1] in cuts_end_pos:
                 candidate_spans.append((i, i + j - 1))
             else:
                 pass  # filter spans
+    return candidate_spans
+
+
+def construct_candidate_spans_by_ddparser(words, max_span_len, delimiter='', min_cover_len=3, is_chinese=True):
+    """
+        Use ddparser to select possible candidate spans
+    :param words: a namedtuple object, contains keys `words` and `labels`
+    :param max_span_len: the max length of candidate spans
+    :param delimiter: str
+    :param min_cover_len: spans that lengths not larger than `min_cover_len` would be preserved
+    :param is_chinese: bool
+     :return: List, [(span_begin1, span_end1), ...]
+    """
+    sentence = delimiter.join(words)
+    candidate_spans = []
+    from ddparser import DDParser
+    ddp = DDParser(use_pos=True)
+    for i in range(len(words)):
+        possible_spans = []
+        for j in range(1, max_span_len + 1):
+            if i + j > len(words) or words[i + j - 1] in punctuations or \
+                    words[i].startswith("的"):
+                break
+            # select spans according to dependency path rule
+            else:
+                possible_spans.append((i, i + j - 1))
+        sentences = [delimiter.join(words[s[0]: s[1] + 1]) for s in possible_spans]
+        results = ddp.parse(sentences)
+        for res, span in zip(results, possible_spans):
+            pass
     return candidate_spans
 
 
@@ -474,7 +763,7 @@ def construct_candidate_spans_based_on_positive_spans(example, max_span_len, neg
             j = random.randint(-2, 2)
             if 0 <= posb + i <= pose + j < len(example.words) and (i != 0 or j != 0) \
                     and pose + j - posb - i + 1 <= max_span_len \
-                    and all(w not in punctuations for w in example.words[posb+i: pose+j+1]):
+                    and all(w not in punctuations for w in example.words[posb + i: pose + j + 1]):
                 candidate_spans.add((posb + i, pose + j))
     return candidate_spans
 
@@ -483,36 +772,42 @@ if __name__ == '__main__':
     import platform
 
     dataset = 'resume'
+    times_of_negative_example = 2.0
     if 'Windows' in platform.platform():
-        # pretrain_path = r'D:\Documents\Github2021\FAN\pretrained_model\facebook-bart-base' \
-        #     if dataset in ['conll2003'] else r'D:\Documents\Github2021\FAN\pretrained_model\fnlp-bart-base-chinese'
-        pretrain_path = r'D:\Documents\Github2021\FAN\pretrained_model\hfl-chinese-bert-wwm-ext'
+        pretrain_path = r'D:\Documents\Github2021\FAN\pretrained_model\facebook-bart-base' \
+            if dataset in ['conll2003'] else r'D:\Documents\Github2021\FAN\pretrained_model\fnlp-bart-base-chinese'
+        # pretrain_path = r'D:\Documents\Github2021\FAN\pretrained_model\hfl-chinese-bert-wwm-ext'
     else:
-        # pretrain_path = r'/home/liujian/NLP/corpus/transformers/facebook-bart-base' \
-        #     if dataset in ['conll2003'] else r'/home/liujian/NLP/corpus/transformers/fnlp-bart-base-chinese'
-        pretrain_path = r'/home/qiumengchuan/NLP/corpus/transformers/hfl-chinese-bert-wwm-ext'
+        pretrain_path = r'/home/qiumengchuan/NLP/corpus/transformers/facebook-bart-base' \
+            if dataset in ['conll2003'] else r'/home/qiumengchuan/NLP/corpus/transformers/fnlp-bart-base-chinese'
+        # pretrain_path = r'/home/qiumengchuan/NLP/corpus/transformers/hfl-chinese-bert-wwm-ext'
     tokenizer = BartTokenizer.from_pretrained(pretrain_path) if dataset in ['conll2003'] \
         else BertTokenizer.from_pretrained(pretrain_path)
     if 'bert' in pretrain_path:
-        model = BertForMaskedLM.from_pretrained(pretrain_path)
+        # model = BertForMaskedLM.from_pretrained(pretrain_path)
+        model = BertLMHeadModel.from_pretrained(pretrain_path)
     else:
-        model = BartForCausalLM.from_pretrained(pretrain_path, add_cross_attention=False)
-
-    times_of_negative_example = 1.5 if dataset in ['msra', 'ontonotes4'] else 2.0
+        # model = BartForCausalLM.from_pretrained(pretrain_path, add_cross_attention=False)
+        model = BartForConditionalGeneration.from_pretrained(pretrain_path)
+    # times_of_negative_example = 1.5 if dataset in ['msra', 'ontonotes4', 'resume'] else 2.0
     dataset2span_params = {'conll2003': (10, 0.0),
                            "weibo": (8, 0.0),
-                           "msra": (15, 0.0),
+                           "msra": (16, 0.0),
                            "ontonotes4": (15, 0.0),
-                           "resume": (20, 0.0)}
+                           "resume": (22, 0.0)}
+    # print(isinstance(model, BertLMHeadModel))
     dataset_processor = DatasetProcessor(dataset_dir=f'./data/{dataset}',
                                          category2template=dataset_category2template[dataset],
                                          span_max_len=dataset2span_params[dataset][0],
                                          span_alpha=dataset2span_params[dataset][1],
-                                         tokenizer=None,
+                                         model=model,
+                                         tokenizer=tokenizer,
                                          analyze_sent_cuts=False)
     dataset_processor.dataset_summary()
-    dataset_processor.to_csv(times_of_negative_example=times_of_negative_example)
+    dataset_processor.to_csv(times_of_negative_example=times_of_negative_example,
+                             filter_method='jieba')
     # dataset_processor.analyze_candidate_span(model, tokenizer)
+    # dataset_processor.analyze_candidate_span_by_bart(model, tokenizer)
 
     # tokenizer = BartTokenizer.from_pretrained(r'D:\Documents\Github2021\FAN\pretrained_model\facebook-bart-base')
     # temp_list = [' '.join(ex.words) for ex in dataset_processor.train_data[:3]]
@@ -520,3 +815,4 @@ if __name__ == '__main__':
     # print(output_ids)
     # text = "️w e i x z ÏÖÜŸａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚＡＢ ⒌ ⒐".split()
     # print(normalize_tokens(text))
+
