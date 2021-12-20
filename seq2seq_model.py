@@ -42,12 +42,14 @@ from transformers import (
     RobertaModel,
     RobertaTokenizer,
     get_linear_schedule_with_warmup,
+    EncoderDecoderModel
 )
 
 from simpletransformers.config.global_args import global_args
 # from modeling_blenderbot_small import BlenderbotSmallForConditionalGeneration
 from simpletransformers.config.model_args import Seq2SeqArgs
-from seq2seq_utils import Seq2SeqDataset, SimpleSummarizationDataset
+from seq2seq_utils import (Seq2SeqDataset, SimpleSummarizationDataset, BartSeq2seqDataLoader,
+                           BucketSampler)
 
 try:
     import wandb
@@ -299,12 +301,22 @@ class Seq2SeqModel:
         args = self.args
 
         tb_writer = SummaryWriter(logdir=args.tensorboard_dir)
-        train_sampler = RandomSampler(train_dataset)
-        train_dataloader = DataLoader(
+        # train_sampler = RandomSampler(train_dataset)
+        # train_dataloader = DataLoader(
+        #     train_dataset,
+        #     sampler=train_sampler,
+        #     batch_size=args.train_batch_size,
+        #     num_workers=self.args.dataloader_num_workers,
+        # )
+        train_sampler = BucketSampler(seq_lens=train_dataset.get_source_seq_lens(),
+                                      batch_size=self.args.train_batch_size,
+                                      num_buckets=min(20, len(train_dataset)))
+        train_dataloader = BartSeq2seqDataLoader(
             train_dataset,
             sampler=train_sampler,
-            batch_size=args.train_batch_size,
+            batch_size=self.args.train_batch_size,
             num_workers=self.args.dataloader_num_workers,
+            pad_vals=[self.encoder_tokenizer.pad_token_id, 0, self.encoder_tokenizer.pad_token_id]
         )
 
         if args.max_steps > 0:
@@ -729,8 +741,14 @@ class Seq2SeqModel:
         results = {}
 
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
+        # eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        eval_dataloader = BartSeq2seqDataLoader(
+            eval_dataset,
+            sampler=eval_sampler,
+            batch_size=self.args.train_batch_size,
+            num_workers=self.args.dataloader_num_workers,
+            pad_vals=[self.encoder_tokenizer.pad_token_id, 0, self.encoder_tokenizer.pad_token_id]
+        )
         if args.n_gpu > 1:
             model = torch.nn.DataParallel(model)
 
@@ -772,8 +790,14 @@ class Seq2SeqModel:
         results = {}
 
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
+        # eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        eval_dataloader = BartSeq2seqDataLoader(
+            eval_dataset,
+            sampler=eval_sampler,
+            batch_size=self.args.train_batch_size,
+            num_workers=self.args.dataloader_num_workers,
+            pad_vals=[self.encoder_tokenizer.pad_token_id, 0, self.encoder_tokenizer.pad_token_id]
+        )
         if args.n_gpu > 1:
             model = torch.nn.DataParallel(model)
 
@@ -1165,7 +1189,8 @@ class Seq2SeqModel:
         import time
         from utils.tools import align_tokens_labels
         from utils.utils_metrics import (get_entities_bio, f1_score, precision_score, recall_score,
-                                         prf1_score_with_entity_length, classification_report)
+                                         prf1_score_with_entity_length, classification_report, get_type_error_rate,
+                                         get_boundary_error_rate, save_scores_as_png)
         from dataset_processor import (dataset_category2template, construct_candidate_spans_by_jieba,
                                        InputExample)
 
@@ -1361,8 +1386,12 @@ class Seq2SeqModel:
             "f1": f1_score(true_entities, pred_entities),
             "precision": precision_score(true_entities, pred_entities),
             "recall": recall_score(true_entities, pred_entities),
-            "entity_length_prf1": prf1_score_with_entity_length(true_entities, pred_entities)
+            "type_error_rate of boundary_correct_entities/pred_error_entities": get_type_error_rate(true_entities,
+                                                                                                    pred_entities),
+            "boundary_error_rate of FP/FN": get_boundary_error_rate(trues_list, preds_list)
         }
+        entity_length_score_list = prf1_score_with_entity_length(true_entities, pred_entities)
+        save_scores_as_png(entity_length_score_list, output_dir=self.hyper_parameters.checkpoint, only_f1=True)
         print(results)
         print(classification_report(true_entities, pred_entities))
         return results
